@@ -1,0 +1,347 @@
+# 第一步：安装依赖（只需运行一次，以后可注释掉）
+!pip install deepxde
+import os
+os.environ["DDE_BACKEND"] = "pytorch"
+
+import deepxde as dde
+import numpy as np
+import torch
+import matplotlib.pyplot as plt
+
+dde.config.set_default_float("float64")
+print("PyTorch is using GPU:", torch.cuda.is_available())
+
+# ==========================================
+# 1. 2D MPINN: 特征转换与【对称硬约束输出层】
+# ==========================================
+def input_transform(x):
+    x_coord = x[:, 0:1]
+    z_coord = x[:, 1:2]
+    t = x[:, 2:3]
+    tau = torch.sqrt(t + 1e-4) 
+    t_scaled = torch.log(1.0 + 100.0 * t)
+    return torch.cat([x_coord, z_coord, t, tau, t_scaled], dim=1)
+
+def output_transform(x, y):
+    x_coord = x[:, 0:1]
+    # 【神来之笔】：强制 x=0.5 (中心轴) 处的水平位移绝对为 0
+    # 这不仅符合物理对称性，还极大减轻了网络的拟合负担
+    u_x_constrained = (x_coord - 0.5) * y[:, 0:1]
+    
+    u_z = y[:, 1:2]
+    p = y[:, 2:3]
+    c = y[:, 3:4]
+    return torch.cat([u_x_constrained, u_z, p, c], dim=1)
+
+# ==========================================
+# 2. 2D 全耦合 PDE 
+# ==========================================
+def pde_2d_hmc(x, y):
+    u_x_nn = y[:, 0:1]; u_x = u_x_nn * 0.01  
+    u_z_nn = y[:, 1:2]; u_z = u_z_nn * 0.01  
+    p_nn   = y[:, 2:3]; p   = p_nn * 50000.0 
+    c_nn   = y[:, 3:4]; c   = c_nn * 10.0    
+
+    p0 = 50000.0; c0 = 10.0
+    T_ref = 100.0 * 3.1536e7
+
+    mv = 5.0e-7; mc = 1.05e-7 * 1000.0; Kd = 8.142e-7 * 1000.0; kh = 1.0e-10
+    R_gas = 8.314; T_temp = 293.15; M_solute = 0.0585
+    kc = kh * (R_gas * T_temp / M_solute)
+
+    gamma_w = 1.0e4; omega = 0.02; n0 = 0.5; rho_s = 2600.0
+    tau = 0.25; D0 = 5e-10; E = 1.49e6; nu = 0.3
+
+    G = E / (2.0 * (1.0 + nu))
+    lambda_ = (E * nu) / ((1.0 + nu) * (1.0 - 2.0 * nu))
+    beta_1 = lambda_ + 2.0 * G  
+    beta_2 = beta_1 * mc        
+
+    beta_3 = kh / gamma_w
+    beta_4 = omega * kc / gamma_w
+    beta_7 = beta_3 * (1.0 - omega) * c0
+    beta_8 = (1.0 - omega) * (beta_4 * c0 - n0 * tau * D0)
+
+    dux_dx = dde.grad.jacobian(y, x, i=0, j=0) * 0.01
+    duz_dz = dde.grad.jacobian(y, x, i=1, j=1) * 0.01
+    dp_dx  = dde.grad.jacobian(y, x, i=2, j=0) * p0
+    dp_dz  = dde.grad.jacobian(y, x, i=2, j=1) * p0
+    dc_dx  = dde.grad.jacobian(y, x, i=3, j=0) * c0
+    dc_dz  = dde.grad.jacobian(y, x, i=3, j=1) * c0
+
+    dp_dt  = dde.grad.jacobian(y, x, i=2, j=2) * p0 / T_ref
+    dc_dt  = dde.grad.jacobian(y, x, i=3, j=2) * c0 / T_ref
+
+    eps_v = dux_dx + duz_dz
+    deps_v_dx = (dde.grad.hessian(y, x, component=0, i=0, j=0) + dde.grad.hessian(y, x, component=1, i=1, j=0)) * 0.01
+    deps_v_dz = (dde.grad.hessian(y, x, component=0, i=0, j=1) + dde.grad.hessian(y, x, component=1, i=1, j=1)) * 0.01
+    deps_v_dt = (dde.grad.jacobian(y, x, i=0, j=2)*0.01 + dde.grad.jacobian(y, x, i=1, j=2)*0.01) / T_ref
+
+    lap_ux = (dde.grad.hessian(y, x, component=0, i=0, j=0) + dde.grad.hessian(y, x, component=0, i=1, j=1)) * 0.01
+    lap_uz = (dde.grad.hessian(y, x, component=1, i=0, j=0) + dde.grad.hessian(y, x, component=1, i=1, j=1)) * 0.01
+    lap_p  = (dde.grad.hessian(y, x, component=2, i=0, j=0) + dde.grad.hessian(y, x, component=2, i=1, j=1)) * p0
+    lap_c  = (dde.grad.hessian(y, x, component=3, i=0, j=0) + dde.grad.hessian(y, x, component=3, i=1, j=1)) * c0
+
+    res_ux = G * lap_ux + (G + lambda_) * deps_v_dx - dp_dx - beta_2 * dc_dx
+    res_uz = G * lap_uz + (G + lambda_) * deps_v_dz - dp_dz - beta_2 * dc_dz
+    res_p = n0 * deps_v_dt + mv * dp_dt - mc * dc_dt - beta_3 * lap_p + beta_4 * lap_c
+    
+    A_chem = (1.0 - n0) * rho_s * Kd * c0
+    B_chem = mv * c0 * (1.0 - rho_s * Kd)
+    C_chem = n0 + (1.0 - n0) * rho_s * Kd + mc * c0 * (rho_s * Kd - 1.0)
+    res_c = A_chem * deps_v_dt + B_chem * dp_dt + C_chem * dc_dt - beta_7 * lap_p + beta_8 * lap_c
+
+    res_ux_norm = res_ux / p0
+    res_uz_norm = res_uz / p0
+    res_p_norm  = res_p * T_ref
+    res_c_norm  = res_c * T_ref
+
+    return [res_ux_norm, res_uz_norm, res_p_norm, res_c_norm]
+
+# ==========================================
+# 3. 几何与【局部高斯分布】边界条件
+# ==========================================
+geom = dde.geometry.Rectangle([0, 0], [1, 1])
+timedomain = dde.geometry.TimeDomain(0, 1)
+geomtime = dde.geometry.GeometryXTime(geom, timedomain)
+
+def on_top(x, on):    return on and np.isclose(x[1], 0)
+def on_bottom(x, on): return on and np.isclose(x[1], 1)
+def on_left(x, on):   return on and np.isclose(x[0], 0)
+def on_right(x, on):  return on and np.isclose(x[0], 1)
+
+bc_p_top = dde.icbc.DirichletBC(geomtime, lambda x: 0.0, on_top, component=2)
+
+# 【核心修改】：正中心泄漏的高斯局部污染源
+bc_c_top = dde.icbc.DirichletBC(
+    geomtime, 
+    lambda x: np.exp(-((x[:, 0:1] - 0.5)**2) / (2 * 0.1**2)), 
+    on_top, 
+    component=3
+)
+
+def shear_top(x, y, X):
+    dux_dz = dde.grad.jacobian(y, x, i=0, j=1) * 0.01
+    duz_dx = dde.grad.jacobian(y, x, i=1, j=0) * 0.01
+    return dux_dz + duz_dx
+bc_shear_top = dde.icbc.OperatorBC(geomtime, shear_top, on_top)
+
+def normal_top(x, y, X):
+    E = 1.49e6; nu = 0.3; mc = 1.05e-4
+    G = E / (2.0 * (1.0 + nu))
+    lambda_ = (E * nu) / ((1.0 + nu) * (1.0 - 2.0 * nu))
+    beta_2 = (lambda_ + 2.0 * G) * mc
+    
+    dux_dx = dde.grad.jacobian(y, x, i=0, j=0) * 0.01
+    duz_dz = dde.grad.jacobian(y, x, i=1, j=1) * 0.01
+    p = y[:, 2:3] * 50000.0
+    c = y[:, 3:4] * 10.0
+    
+    sigma_zz = (2*G + lambda_)*duz_dz + lambda_*dux_dx - p - beta_2*c
+    return (sigma_zz + 50000.0) / 50000.0
+bc_normal_top = dde.icbc.OperatorBC(geomtime, normal_top, on_top)
+
+bc_ux_bot = dde.icbc.DirichletBC(geomtime, lambda x: 0.0, on_bottom, component=0)
+bc_uz_bot = dde.icbc.DirichletBC(geomtime, lambda x: 0.0, on_bottom, component=1)
+bc_p_bot  = dde.icbc.NeumannBC(geomtime, lambda x: 0.0, on_bottom, component=2)
+bc_c_bot  = dde.icbc.NeumannBC(geomtime, lambda x: 0.0, on_bottom, component=3)
+
+bc_ux_left  = dde.icbc.DirichletBC(geomtime, lambda x: 0.0, on_left, component=0)
+bc_ux_right = dde.icbc.DirichletBC(geomtime, lambda x: 0.0, on_right, component=0)
+bc_uz_left  = dde.icbc.NeumannBC(geomtime, lambda x: 0.0, on_left, component=1)
+bc_uz_right = dde.icbc.NeumannBC(geomtime, lambda x: 0.0, on_right, component=1)
+
+bc_p_left  = dde.icbc.NeumannBC(geomtime, lambda x: 0.0, on_left, component=2)
+bc_p_right = dde.icbc.NeumannBC(geomtime, lambda x: 0.0, on_right, component=2)
+bc_c_left  = dde.icbc.NeumannBC(geomtime, lambda x: 0.0, on_left, component=3)
+bc_c_right = dde.icbc.NeumannBC(geomtime, lambda x: 0.0, on_right, component=3)
+
+ic_ux = dde.icbc.IC(geomtime, lambda x: 0.0, lambda _, on: on, component=0)
+ic_uz = dde.icbc.IC(geomtime, lambda x: 0.0, lambda _, on: on, component=1)
+ic_p  = dde.icbc.IC(geomtime, lambda x: 1.0, lambda _, on: on, component=2)
+ic_c  = dde.icbc.IC(geomtime, lambda x: 0.0, lambda _, on: on, component=3)
+
+bcs = [
+    bc_p_top, bc_c_top, bc_shear_top, bc_normal_top,
+    bc_ux_bot, bc_uz_bot, bc_p_bot, bc_c_bot,
+    bc_ux_left, bc_uz_left, bc_p_left, bc_c_left,
+    bc_ux_right, bc_uz_right, bc_p_right, bc_c_right,
+    ic_ux, ic_uz, ic_p, ic_c
+]
+
+data = dde.data.TimePDE(
+    geomtime, pde_2d_hmc, bcs,
+    num_domain=8000, num_boundary=2000, num_initial=1000
+)
+
+# ==========================================
+# 4. 网络定义与约束挂载
+# ==========================================
+n# 加深且加宽
+net = dde.nn.FNN([5] + [128] * 8 + [4], "tanh", "Glorot normal")
+net.apply_feature_transform(input_transform)
+net.apply_output_transform(output_transform)  # 挂载对称硬约束
+model = dde.Model(data, net)
+
+# ==========================================
+# 5. 训练执行 (包含 RAR 镇压)
+# ==========================================
+print("\n>>> 阶段 1: Adam 预热与 RAR 痛点打击")
+
+loss_weights = [
+    1, 1, 1, 1,         
+    100, 100, 100, 100, 
+    1000, 1000, 10, 10, 
+    2000, 10, 10, 10,   
+    2000, 10, 10, 10,   
+    1000, 1000, 100, 100
+]
+
+model.compile("adam", lr=1e-3, loss_weights=loss_weights)
+model.train(iterations=4000)
+
+for i in range(3):
+    print(f"\n--- RAR 巡航第 {i+1} 轮: 捕获全场最高残差点 ---")
+    X_search = geomtime.random_points(40000)
+    err = model.predict(X_search, operator=pde_2d_hmc)
+    err_eq = np.abs(err[0]) + np.abs(err[1]) + np.abs(err[2]) + np.abs(err[3])
+    err_eq = err_eq.flatten()
+    top_k_idx = np.argsort(err_eq)[-400:]
+    X_new = X_search[top_k_idx]
+    data.add_anchors(X_new)
+    
+    model.compile("adam", lr=5e-4, loss_weights=loss_weights)
+    model.train(iterations=2000)
+
+# --- Adam 阶段：保持原样，稳固边界 ---
+model.compile("adam", lr=1e-3, loss_weights=loss_weights)
+model.train(iterations=4000)
+# ... 中间的 RAR 保持不变 ...
+
+# --- L-BFGS 阶段：重置权重，提升 PDE 地位 ---
+print("\n>>> 阶段 2: L-BFGS 极致榨取收敛 (物理接管)")
+dde.optimizers.config.set_LBFGS_options(maxiter=20000, ftol=1e-9, gtol=1e-9) # 逼它练到底
+
+# 将 PDE 权重从 1 提升到 50 甚至 100，同时适当降低某些 BC 的离谱高权重 (比如 2000 降到 500)
+lbfgs_weights = [
+    50, 50, 50, 50,           # 核心：强抬 PDE 残差惩罚
+    100, 100, 100, 100, 
+    500, 500, 10, 10,         # 适当压低极端边界权重
+    500, 10, 10, 10,    
+    500, 10, 10, 10,    
+    500, 500, 100, 100
+]
+model.compile("L-BFGS", loss_weights=lbfgs_weights)
+model.train()
+
+# ==========================================
+# 6. 后处理出图
+# ==========================================
+print("\n>>> 模型训练完成，正在生成 2D 污染图表...")
+
+p0 = 50000.0; c0 = 10.0
+plot_times_years = [1, 10, 20, 50]
+colors = ['purple', 'b', 'g', 'r']
+line_styles = ['-', '--', '-.', ':']
+
+z_1d = np.linspace(0, 1, 100).reshape(-1, 1)
+x_center = np.full_like(z_1d, 0.5)
+
+plt.figure(figsize=(18, 5))
+
+plt.subplot(1, 3, 1)
+for i, t_yr in enumerate(plot_times_years):
+    t_val = t_yr / 100.0
+    t_arr = np.full_like(z_1d, t_val)
+    X_input = np.hstack((x_center, z_1d, t_arr))
+    y_pred = model.predict(X_input)
+    c_ratio = y_pred[:, 3] 
+    plt.plot(z_1d, c_ratio, color=colors[i], linestyle=line_styles[i], lw=2.5, label=f't={t_yr}y')
+
+plt.title("Centerline Concentration (x=0.5)")
+plt.xlabel("Depth (m)")
+plt.ylabel("Normalized Concentration ($C/C_0$)")
+plt.legend()
+plt.grid(True)
+
+plt.subplot(1, 3, 2)
+for i, t_yr in enumerate(plot_times_years):
+    t_val = t_yr / 100.0
+    t_arr = np.full_like(z_1d, t_val)
+    X_input = np.hstack((x_center, z_1d, t_arr))
+    y_pred = model.predict(X_input)
+    u_pa = y_pred[:, 2] * p0 
+    plt.plot(z_1d, u_pa / 1000.0, color=colors[i], linestyle=line_styles[i], lw=2.5, label=f't={t_yr}y')
+
+plt.title("Centerline Pore Pressure (x=0.5)")
+plt.xlabel("Depth (m)")
+plt.ylabel("Pore Pressure (kPa)")
+plt.legend()
+plt.grid(True)
+
+plt.subplot(1, 3, 3)
+t_points = np.logspace(-4, 0, 200).reshape(-1, 1)
+x_surf = np.full_like(t_points, 0.5)
+z_surf = np.zeros_like(t_points)
+
+X_surf_input = np.hstack((x_surf, z_surf, t_points))
+y_surf_pred = model.predict(X_surf_input)
+settlement_mm = y_surf_pred[:, 1] * 0.01 * 1000.0 
+
+plt.plot(t_points * 100.0, settlement_mm, 'k-', lw=3, label="Center Settlement")
+plt.title("Center Surface Settlement (x=0.5, z=0)")
+plt.xlabel("Time (Years)")
+plt.ylabel("Settlement (mm)")
+plt.xscale('log')
+plt.legend()
+plt.grid(True, which="both", ls="--")
+
+plt.tight_layout()
+plt.show()
+
+print("\n>>> 正在生成 t = 100 年时的二维全场云图...")
+nx, nz = 100, 100
+x_grid = np.linspace(0, 1, nx)
+z_grid = np.linspace(0, 1, nz)
+X_mesh, Z_mesh = np.meshgrid(x_grid, z_grid)
+
+X_flat = X_mesh.flatten().reshape(-1, 1)
+Z_flat = Z_mesh.flatten().reshape(-1, 1)
+T_flat = np.full_like(X_flat, 1.0) 
+
+X_input_2d = np.hstack((X_flat, Z_flat, T_flat))
+y_pred_2d = model.predict(X_input_2d)
+
+Ux_2d = (y_pred_2d[:, 0] * 0.01 * 1000.0).reshape(nz, nx) 
+Uz_2d = (y_pred_2d[:, 1] * 0.01 * 1000.0).reshape(nz, nx) 
+P_2d  = (y_pred_2d[:, 2] * p0 / 1000.0).reshape(nz, nx)   
+C_2d  = (y_pred_2d[:, 3]).reshape(nz, nx)                 
+
+fig, axes = plt.subplots(1, 4, figsize=(22, 5))
+
+im0 = axes[0].contourf(X_mesh, Z_mesh, Ux_2d, levels=50, cmap='RdBu_r')
+axes[0].invert_yaxis()
+axes[0].set_title("Horiz. Disp. $u_x$ (mm) at 100 yrs")
+axes[0].set_xlabel("x (m)"); axes[0].set_ylabel("z (m)")
+fig.colorbar(im0, ax=axes[0])
+
+im1 = axes[1].contourf(X_mesh, Z_mesh, Uz_2d, levels=50, cmap='jet')
+axes[1].invert_yaxis()
+axes[1].set_title("Vertical Settlement $u_z$ (mm) at 100 yrs")
+axes[1].set_xlabel("x (m)")
+fig.colorbar(im1, ax=axes[1])
+
+im2 = axes[2].contourf(X_mesh, Z_mesh, P_2d, levels=50, cmap='viridis')
+axes[2].invert_yaxis()
+axes[2].set_title("Pore Pressure $p$ (kPa) at 100 yrs")
+axes[2].set_xlabel("x (m)")
+fig.colorbar(im2, ax=axes[2])
+
+im3 = axes[3].contourf(X_mesh, Z_mesh, C_2d, levels=50, cmap='plasma')
+axes[3].invert_yaxis()
+axes[3].set_title("Concentration $C/C_0$ at 100 yrs")
+axes[3].set_xlabel("x (m)")
+fig.colorbar(im3, ax=axes[3])
+
+plt.tight_layout()
+plt.show()
