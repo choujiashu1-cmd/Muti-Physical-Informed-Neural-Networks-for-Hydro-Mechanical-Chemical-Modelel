@@ -1,0 +1,224 @@
+#修改后的解析解与PINN对比
+import numpy as np
+import matplotlib.pyplot as plt
+import pandas as pd
+from dataclasses import dataclass
+import os
+
+# ==========================================
+# 1. 物理参数与系数数据类 (保持绝对一致)
+# ==========================================
+@dataclass(frozen=True)
+class HMCParameters:
+    sec_per_year: float = 3.1536e7
+    t_ref: float = 100.0 * 3.1536e7
+    length: float = 1.0
+    p0: float = 50000.0
+    c0: float = 10.0
+    n_series: int = 200
+
+    mv: float = 5.0e-7
+    mc: float = 1.05e-7 * 1000.0
+    kd: float = 8.142e-7 * 1000.0
+    kh: float = 1.0e-10
+
+    r_gas: float = 8.314
+    t_temp: float = 293.15
+    m_solute: float = 0.0585
+    gamma_w: float = 1.0e4
+    omega: float = 0.02
+    n0: float = 0.5
+    rho_s: float = 2600.0
+    tau: float = 0.25
+    d0: float = 5e-10
+    e_modulus: float = 1.49e6
+    nu: float = 0.3
+
+@dataclass(frozen=True)
+class HMCCoefficients:
+    beta1: float
+    beta2: float
+    q12: float
+    q21: float
+    q1: float
+    q2: float
+
+# ==========================================
+# 2. 彻底修复的解析解求解器 (补回 p0，修正符号)
+# ==========================================
+class AnalyticalHMCSolution:
+    def __init__(self, params: HMCParameters | None = None):
+        self.params = params or HMCParameters()
+        self.coeffs = self._build_coefficients()
+
+    def _build_coefficients(self) -> HMCCoefficients:
+        p = self.params
+        kc = p.kh * (p.r_gas * p.t_temp / p.m_solute)
+        beta1 = p.e_modulus * (1.0 - p.nu) / ((1.0 + p.nu) * (1.0 - 2.0 * p.nu))
+        beta2 = beta1 * p.mc
+        beta3 = p.kh / p.gamma_w
+        beta4 = p.omega * kc / p.gamma_w
+        beta5 = p.mv * p.c0 * (1.0 - p.rho_s * p.kd)
+        beta6 = p.n0 + (1.0 - p.n0) * p.rho_s * p.kd + p.mc * p.c0 * (p.rho_s * p.kd - 1.0)
+        beta7 = beta3 * (1.0 - p.omega) * p.c0
+        beta8 = (1.0 - p.omega) * (beta4 * p.c0 - p.n0 * p.tau * p.d0)
+        beta9 = (1.0 - p.n0) * p.rho_s * p.kd * p.c0
+
+        denom = (
+            (beta1 * p.mc - beta2 * p.n0) * (beta1 * beta5 + beta9)
+            + (beta1 * beta6 + beta2 * beta9) * (beta1 * p.mv + p.n0)
+        )
+
+        a1 = beta1 * (beta7 * (beta1 * p.mc - beta2 * p.n0) + beta3 * (beta1 * beta6 + beta2 * beta9)) / denom
+        a2 = -beta1 * (beta8 * (beta1 * p.mc - beta2 * p.n0) + beta4 * (beta1 * beta6 + beta2 * beta9)) / denom
+        a3 = -beta1 * (beta3 * (beta1 * beta5 + beta9) - beta7 * (beta1 * p.mv + p.n0)) / denom
+        a4 = beta1 * (beta4 * (beta1 * beta5 + beta9) - beta8 * (beta1 * p.mv + p.n0)) / denom
+
+        disc = (a1 - a4) ** 2 + 4.0 * a2 * a3
+        q1 = (a1 + a4 + np.sqrt(disc)) / 2.0
+        q2 = (a1 + a4 - np.sqrt(disc)) / 2.0
+        q21 = (q1 - a1) / a3
+        q12 = (q2 - a4) / a2
+
+        return HMCCoefficients(beta1, beta2, q12, q21, q1, q2)
+
+    def pore_pressure_and_concentration(self, depth_m, time_years):
+        p = self.params
+        c = self.coeffs
+        z = np.asarray(depth_m, dtype=np.float64).reshape(-1, 1)
+        t_sec = float(time_years) * p.sec_per_year
+
+        n = np.arange(p.n_series, dtype=np.float64).reshape(-1, 1)
+        lam = (n + 0.5) * np.pi / p.length
+        sin_term = np.sin(lam * z.T)
+        coeff = 1.0 / (2.0 * n + 1.0)
+
+        e1 = np.exp(-(lam**2) * c.q1 * t_sec)
+        e2 = np.exp(-(lam**2) * c.q2 * t_sec)
+
+        series_c = (c.q12 * p.p0 - p.c0) * e2 - c.q12 * (p.p0 - c.q21 * p.c0) * e1
+        series_u = (p.p0 - c.q21 * p.c0) * e1 - c.q21 * (c.q12 * p.p0 - p.c0) * e2
+
+        factor = 4.0 / ((1.0 - c.q12 * c.q21) * np.pi)
+        concentration = factor * np.sum(coeff * sin_term * series_c, axis=0).reshape(-1, 1) + p.c0
+        pore_pressure = factor * np.sum(coeff * sin_term * series_u, axis=0).reshape(-1, 1)
+        return pore_pressure[:, 0], concentration[:, 0]
+
+    def settlement(self, depth_m, time_years):
+        p = self.params
+        c = self.coeffs
+        z = np.asarray(depth_m, dtype=np.float64).reshape(-1, 1)
+        t_sec = float(time_years) * p.sec_per_year
+
+        n = np.arange(p.n_series, dtype=np.float64).reshape(-1, 1)
+        lam = (n + 0.5) * np.pi / p.length
+        cos_term = np.cos(lam * z.T)
+        coeff = 1.0 / ((2.0 * n + 1.0) * lam)
+
+        e1 = np.exp(-(lam**2) * c.q1 * t_sec)
+        e2 = np.exp(-(lam**2) * c.q2 * t_sec)
+
+        # 修复后的瞬态级数项
+        series = (
+            -(c.beta2 + c.q21) * (p.c0 - c.q12 * p.p0) * e2
+            + (1.0 + c.q12 * c.beta2) * (c.q21 * p.c0 - p.p0) * e1
+        )
+
+        factor = 4.0 / ((1.0 - c.q12 * c.q21) * c.beta1 * np.pi)
+        wz_series = np.sum(coeff * cos_term * series, axis=0).reshape(-1, 1)
+        
+        # 修复后的稳态沉降项 (包含外部力学荷载 p0)
+        wz_linear = (p.p0 + c.beta2 * p.c0) * (p.length - z) / c.beta1
+        
+        return (factor * wz_series + wz_linear)[:, 0]
+
+    def surface_settlement_increment_mm(self, time_years):
+        # 物理上起步严格为 0，不再需要强制相减，直接返回 t 时刻表面沉降即可
+        wzt = self.settlement([0.0], time_years)[0]
+        return wzt * 1000.0
+
+# ==========================================
+# 3. 数据读取与出图对比
+# ==========================================
+# 使用 os.path 动态获取当前脚本所在目录，避免终端路径不一致导致找不到文件
+current_dir = os.path.dirname(os.path.abspath(__file__))
+profile_file = os.path.join(current_dir, 'MPINN_Profile_Data_1_10_20_50_RAR.csv')
+settlement_file = os.path.join(current_dir, 'MPINN_Settlement_Data_RAR.csv')
+
+try:
+    df_pinn_prof = pd.read_csv(profile_file)
+    df_pinn_sett = pd.read_csv(settlement_file)
+    print(">>> 成功读取 PINN 数据！准备绘制对比图...")
+except FileNotFoundError as e:
+    print(f">>> 错误：未能找到 CSV 文件。报错详情：{e}")
+    print(f"请确保 CSV 文件与本 Python 脚本位于同一文件夹: {current_dir}")
+    raise
+
+# 初始化解析解
+solver = AnalyticalHMCSolution()
+c0 = solver.params.c0
+
+plot_times_years = [1, 10, 20, 50]
+colors = ['purple', 'b', 'g', 'r']
+line_styles = ['-', '--', '-.', ':']
+
+# 生成解析解所用的网格 (可以更密一点保证光滑)
+z_ana = np.linspace(0, solver.params.length, 200)
+t_ana = np.logspace(-4, np.log10(100.0), 400)
+
+plt.figure(figsize=(18, 6))
+
+# --- 图 A：浓度剖面对比 ---
+plt.subplot(1, 3, 1)
+for i, t_yr in enumerate(plot_times_years):
+    # 1. 绘制解析解 (实线)
+    _, c_ana = solver.pore_pressure_and_concentration(z_ana, t_yr)
+    plt.plot(z_ana, c_ana / c0, color=colors[i], linestyle='-', lw=2.5, label=f'Analytical: t={t_yr}y')
+    
+    # 2. 绘制 PINN 解 (虚线 + 散点)
+    z_pinn = df_pinn_prof['Depth_m']
+    c_pinn = df_pinn_prof[f'Concentration_kg_m3_{t_yr}yr'] / c0
+    plt.plot(z_pinn, c_pinn, color=colors[i], linestyle='--', marker='o', markevery=10, markersize=5, lw=1.5, alpha=0.8, label=f'PINN: t={t_yr}y')
+
+plt.title("Concentration Profiles\n(Solid: Analytical | Dashed: PINN)")
+plt.xlabel("Depth (m)")
+plt.ylabel("Normalized Concentration ($C/C_0$)")
+plt.legend(fontsize=8, loc='upper right', ncol=2)
+plt.grid(True, alpha=0.5)
+
+# --- 图 B：孔压剖面对比 ---
+plt.subplot(1, 3, 2)
+for i, t_yr in enumerate(plot_times_years):
+    # 1. 绘制解析解
+    u_ana_pa, _ = solver.pore_pressure_and_concentration(z_ana, t_yr)
+    plt.plot(z_ana, u_ana_pa / 1000.0, color=colors[i], linestyle='-', lw=2.5)
+    
+    # 2. 绘制 PINN 解
+    u_pinn_kpa = df_pinn_prof[f'PorePressure_kPa_{t_yr}yr']
+    plt.plot(z_pinn, u_pinn_kpa, color=colors[i], linestyle='--', marker='o', markevery=10, markersize=5, lw=1.5, alpha=0.8)
+
+plt.title("Pore Pressure Profiles\n(Solid: Analytical | Dashed: PINN)")
+plt.xlabel("Depth (m)")
+plt.ylabel("Pore Pressure (kPa)")
+plt.grid(True, alpha=0.5)
+
+# --- 图 C：100 年沉降时程对比 ---
+plt.subplot(1, 3, 3)
+# 1. 绘制解析解 (黑色实线)
+settlement_ana = [solver.surface_settlement_increment_mm(t) for t in t_ana]
+plt.plot(t_ana, settlement_ana, 'k-', lw=3, label='Analytical (Corrected)')
+
+# 2. 绘制 PINN 解 (红色散点)
+t_pinn = df_pinn_sett['Time_years']
+sett_pinn = df_pinn_sett['Settlement_mm']
+plt.scatter(t_pinn, sett_pinn, color='red', s=10, alpha=0.6, label='PINN Prediction')
+
+plt.title("Surface Settlement vs Time\n(Black Line: Analytical | Red Dots: PINN)")
+plt.xlabel("Time (Years)")
+plt.ylabel("Settlement (mm)")
+plt.xscale('log')
+plt.legend()
+plt.grid(True, which="both", ls="--", alpha=0.5)
+
+plt.tight_layout()
+plt.show()
