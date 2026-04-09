@@ -1,0 +1,1 @@
+# Muti-Physical-Informed-Neural-Networks-for-Hydro-Mechanical-Chemical-Modelel
