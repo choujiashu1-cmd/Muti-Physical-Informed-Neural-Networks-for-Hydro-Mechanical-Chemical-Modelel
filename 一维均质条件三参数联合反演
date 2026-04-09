@@ -1,0 +1,245 @@
+!pip install deepxde
+!pip install pandas
+!pip install openpyxl
+import os
+os.environ["DDE_BACKEND"] = "pytorch"
+
+import deepxde as dde
+import numpy as np
+import torch
+import matplotlib.pyplot as plt
+import pandas as pd
+
+dde.config.set_default_float("float64")
+print("🚀 PyTorch is using GPU:", torch.cuda.is_available())
+
+# ==========================================
+# 0. 锁定随机种子
+# ==========================================
+MAGIC_SEED = 42
+dde.config.set_random_seed(MAGIC_SEED)
+np.random.seed(MAGIC_SEED)
+torch.manual_seed(MAGIC_SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(MAGIC_SEED)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+# ==========================================
+# 1. 终极参数矩阵 (3个参数全部 10 倍涡轮增压)
+# ==========================================
+log_kh_scaled = dde.Variable(-1.1) 
+log_D0_scaled = dde.Variable(-1.0) 
+log_mv_scaled = dde.Variable(-0.7) 
+
+def input_transform(x):
+    z = x[:, 0:1]; t = x[:, 1:2]
+    return torch.cat([z, t, torch.log(1.0 + 100.0 * t)], dim=1)
+
+# ==========================================
+# 2. PDE 动态物理场映射
+# ==========================================
+def pde_inverse_hmc(x, y):
+    U, C = y[:, 0:1], y[:, 1:2]
+    Z, T = x[:, 0:1], x[:, 1:2]
+
+    L_real = 1.0; T_ref = 100.0 * 3.1536e7; p0 = 50000.0; c0 = 10.0
+    mc = 1.05e-7 * 1000.0; Kd = 8.142e-7 * 1000.0
+    
+    # 【参数解压】
+    kh_current = 10.0 ** (log_kh_scaled * 10.0)
+    D0_current = 10.0 ** (log_D0_scaled * 10.0)
+    mv_current = 10.0 ** (log_mv_scaled * 10.0)
+    
+    R_gas = 8.314; T_temp = 293.15; M_solute = 0.0585
+    kc = kh_current * (R_gas * T_temp / M_solute) 
+
+    gamma_w = 1.0e4; omega = 0.02; n0 = 0.5; rho_s = 2600.0; tau = 0.25; E = 1.49e6; nu = 0.3
+
+    beta_1 = (E * (1 - nu)) / ((1 + nu) * (1 - 2 * nu))
+    beta_2 = beta_1 * mc
+    alpha_1 = mv_current + n0 / beta_1
+    alpha_2 = mc * (n0 - 1)
+    alpha_3 = mv_current * c0 * (1 - rho_s * Kd) + ((1 - n0) * rho_s * Kd * c0) / beta_1
+    alpha_4 = n0 + (1 - n0) * rho_s * Kd + mc * c0 * (rho_s * Kd - 1) - (1 - n0) * rho_s * Kd * c0 * mc
+
+    beta_3 = kh_current / gamma_w
+    beta_4 = omega * kc / gamma_w
+    beta_7 = beta_3 * (1 - omega) * c0
+    beta_8 = (1 - omega) * (beta_4 * c0 - n0 * tau * D0_current)
+
+    C30_U_T = 1.0; C30_C_T = (alpha_2 * c0) / (alpha_1 * p0)
+    C30_U_ZZ = (beta_3 * T_ref) / (alpha_1 * L_real**2)
+    C30_C_ZZ = (beta_4 * c0 * T_ref) / (alpha_1 * p0 * L_real**2)
+    C31_U_T = (alpha_3 * p0) / (alpha_4 * c0); C31_C_T = 1.0
+    C31_U_ZZ = (beta_7 * p0 * T_ref) / (alpha_4 * c0 * L_real**2)
+    C31_C_ZZ = (beta_8 * T_ref) / (alpha_4 * L_real**2)
+
+    U_T = dde.grad.jacobian(y, x, i=0, j=1); C_T = dde.grad.jacobian(y, x, i=1, j=1)
+    U_ZZ = dde.grad.hessian(y, x, component=0, i=0, j=0); C_ZZ = dde.grad.hessian(y, x, component=1, i=0, j=0)
+
+    res_U = (C30_U_T * U_T + C30_C_T * C_T) - (C30_U_ZZ * U_ZZ - C30_C_ZZ * C_ZZ)
+    res_C = (C31_U_T * U_T + C31_C_T * C_T) - (C31_U_ZZ * U_ZZ - C31_C_ZZ * C_ZZ)
+    return [res_U, res_C]
+
+# ==========================================
+# 3. 边界条件与分布锚点
+# ==========================================
+geom = dde.geometry.Interval(0, 1); timedomain = dde.geometry.TimeDomain(0, 1)
+geomtime = dde.geometry.GeometryXTime(geom, timedomain)
+
+def smooth_c_top(x):
+    t = x[:, 1:2]
+    return 1.0 - torch.exp(-1000.0 * t) if isinstance(t, torch.Tensor) else 1.0 - np.exp(-1000.0 * t)
+
+bc_u_top = dde.DirichletBC(geomtime, lambda x: 0.0, lambda x, on: on and np.isclose(x[0], 0), component=0)
+bc_c_top = dde.DirichletBC(geomtime, smooth_c_top, lambda x, on: on and np.isclose(x[0], 0), component=1)
+bc_u_bot = dde.NeumannBC(geomtime, lambda x: 0.0, lambda x, on: on and np.isclose(x[0], 1), component=0)
+bc_c_bot = dde.NeumannBC(geomtime, lambda x: 0.0, lambda x, on: on and np.isclose(x[0], 1), component=1)
+ic_u = dde.IC(geomtime, lambda x: 1.0, lambda _, on: on, component=0)
+ic_c = dde.IC(geomtime, lambda x: 0.0, lambda _, on: on, component=1)
+
+Z_grid, T_grid = np.meshgrid(np.linspace(0, 1, 50), np.linspace(0, 0.02, 50))
+X_early_anchors = np.hstack((Z_grid.flatten()[:, None], T_grid.flatten()[:, None]))
+
+# ==========================================
+# 4. 读取原生 XLSX 数据集 (直接从当前目录读取)
+# ==========================================
+ob_z, ob_t, ob_u, ob_c = [], [], [], []
+try:
+    # 完美匹配截图，去掉 Data/ 前缀，直接读取同级目录文件
+    df_u = pd.read_excel('孔压数据_0.1,1,10,50.xlsx')
+    df_c = pd.read_excel('浓度数据_0.1,1,10,50.xlsx')
+    
+    z_vals = df_u['z_m'].values
+    
+    for i in range(len(z_vals)):
+        z = z_vals[i]
+        
+        # 1. 极其关键：【注释掉】0.1年的激波数据，防止 L-BFGS 曲率爆炸
+        # ob_z.append(z); ob_t.append(0.001)
+        # ob_u.append(df_u['0.1a'].values[i] / 50000.0)
+        # ob_c.append(df_c['0.1a'].values[i] / 10.0)
+        
+        # 2. 早期关键时刻: 1 年 (t=0.01) - 刚刚好的陡峭度，足够锁死 kh！
+        ob_z.append(z); ob_t.append(0.01)
+        ob_u.append(df_u['1a'].values[i] / 50000.0)
+        ob_c.append(df_c['1a'].values[i] / 10.0)
+
+        # 3. 中期时刻: 10 年 (t=0.1)
+        ob_z.append(z); ob_t.append(0.1)
+        ob_u.append(df_u['10a'].values[i] / 50000.0)
+        ob_c.append(df_c['10a'].values[i] / 10.0)
+        
+        # 4. 晚期时刻: 50 年 (t=0.5)
+        ob_z.append(z); ob_t.append(0.5)
+        ob_u.append(df_u['50a'].values[i] / 50000.0)
+        ob_c.append(df_c['50a'].values[i] / 10.0)
+
+    print(f"\n>>> 成功提取 {len(ob_u)} 个孔压与浓度交叉锚点！(包含 1 年早期刚性防爆锚点)")
+except Exception as e:
+    print(f"\n>>> [致命错误] 数据读取失败 ({e})。")
+
+ob_pt = np.hstack((np.array(ob_z).reshape(-1,1), np.array(ob_t).reshape(-1,1)))
+observe_p = dde.icbc.PointSetBC(ob_pt, np.array(ob_u).reshape(-1,1), component=0)
+observe_c = dde.icbc.PointSetBC(ob_pt, np.array(ob_c).reshape(-1,1), component=1)
+
+data = dde.data.TimePDE(
+    geomtime, pde_inverse_hmc,
+    [bc_u_top, bc_c_top, bc_u_bot, bc_c_bot, ic_u, ic_c, observe_p, observe_c], 
+    num_domain=5000, num_boundary=500, num_initial=1000, anchors=X_early_anchors
+)
+
+# ==========================================
+# 5. 4090 终极平稳防爆策略 (降低 L-BFGS 极端权重)
+# ==========================================
+net = dde.nn.FNN([3] + [128] * 8 + [2], "tanh", "Glorot normal")
+net.apply_feature_transform(input_transform)
+model = dde.Model(data, net)
+
+dat_filename = "multi_params_history_with_1yr.dat"
+variable_cb = dde.callbacks.VariableValue(
+    [log_kh_scaled, log_D0_scaled, log_mv_scaled], 
+    period=100, filename=dat_filename
+)
+
+# 阶段一：稳健探路
+adam_weights = [1.0, 1.0,  100, 100, 100, 100,  200, 200,  10000, 10000]
+print("\n>>> 开始全时域大满贯极限反演！采用防爆策略探路...")
+model.compile("adam", lr=1e-4, external_trainable_variables=[log_kh_scaled, log_D0_scaled, log_mv_scaled], loss_weights=adam_weights)
+model.train(iterations=15000, callbacks=[variable_cb])
+
+# 阶段二：二阶优化绝杀 (权重降到 10000，防止梯度撑爆)
+lbfgs_weights = [10.0, 10.0,  100, 100, 100, 100,  200, 200,  200, 200]
+dde.optimizers.config.set_LBFGS_options(maxiter=20000)
+model.compile("L-BFGS", external_trainable_variables=[log_kh_scaled, log_D0_scaled, log_mv_scaled], loss_weights=lbfgs_weights)
+model.train(callbacks=[variable_cb])
+# ==========================================
+# 6. 一键保存大满贯大脑与预测场
+# ==========================================
+save_dir = "HMC_Ultimate_Results"
+os.makedirs(save_dir, exist_ok=True)
+model.save(os.path.join(save_dir, "HMC_3Params_Ultimate.ckpt"))
+print("\n>>> 🏆 [1/2] 大满贯模型大脑已落袋！")
+
+z_dense = np.linspace(0, 1, 100)
+t_dense = np.linspace(0, 1, 100)
+Z_dense, T_dense = np.meshgrid(z_dense, t_dense)
+X_predict = np.hstack((Z_dense.flatten()[:, None], T_dense.flatten()[:, None]))
+
+y_predict = model.predict(X_predict)
+df_fields = pd.DataFrame({
+    'Depth_z': X_predict[:, 0],
+    'Time_t': X_predict[:, 1],
+    'PorePressure_U_pred': y_predict[:, 0],
+    'Concentration_C_pred': y_predict[:, 1]
+})
+df_fields.to_csv(os.path.join(save_dir, "HMC_Predicted_Fields_Ultimate.csv"), index=False)
+print(">>> 🏆 [2/2] 大满贯高清物理场数据已导出！")
+
+# ==========================================
+# 7. 自动化：一键出极品三联图 (直接在终端/Notebook弹图)
+# ==========================================
+try:
+    print("\n>>> 正在清洗数据并生成大满贯终极三联图...")
+    steps_list, kh_pred, D0_pred, mv_pred = [], [], [], []
+    with open(dat_filename, "r") as f:
+        for line in f:
+            clean_line = line.replace("[", " ").replace("]", " ").replace(",", " ").strip()
+            if not clean_line: continue
+            parts = clean_line.split()
+            steps_list.append(float(parts[0]))
+            kh_pred.append(float(parts[1]) * 10.0)
+            D0_pred.append(float(parts[2]) * 10.0)
+            mv_pred.append(float(parts[3]) * 10.0)
+
+    steps_arr = np.array(steps_list)
+    kh_true = -10.0; D0_true = np.log10(5.0e-10); mv_true = np.log10(5.0e-7)
+
+    fig, axes = plt.subplots(3, 1, figsize=(10, 12), sharex=True)
+    
+    # Plot kh
+    axes[0].plot(steps_arr, kh_pred, 'r-', lw=3, label="PINN Inverted $k_h$")
+    axes[0].axhline(y=kh_true, color='k', linestyle='--', lw=2, label=f"True Value ({kh_true:.2f})")
+    axes[0].set_ylabel("$\log_{10}(k_h)$", fontsize=12)
+    axes[0].set_title("Simultaneous Multi-Parameter Inversion (with Early Data)", fontsize=14, fontweight='bold')
+    axes[0].legend(loc="lower right"); axes[0].grid(True, linestyle='--', alpha=0.7)
+
+    # Plot D0
+    axes[1].plot(steps_arr, D0_pred, 'b-', lw=3, label="PINN Inverted $D_0$")
+    axes[1].axhline(y=D0_true, color='k', linestyle='--', lw=2, label=f"True Value ({D0_true:.2f})")
+    axes[1].set_ylabel("$\log_{10}(D_0)$", fontsize=12)
+    axes[1].legend(loc="lower right"); axes[1].grid(True, linestyle='--', alpha=0.7)
+
+    # Plot mv
+    axes[2].plot(steps_arr, mv_pred, 'g-', lw=3, label="PINN Inverted $m_v$")
+    axes[2].axhline(y=mv_true, color='k', linestyle='--', lw=2, label=f"True Value ({mv_true:.2f})")
+    axes[2].set_ylabel("$\log_{10}(m_v)$", fontsize=12); axes[2].set_xlabel("Training Steps", fontsize=12)
+    axes[2].legend(loc="lower right"); axes[2].grid(True, linestyle='--', alpha=0.7)
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, "Multi_Params_Inversion_Ultimate.png"), dpi=300)
+    plt.show()
+    print(">>> 🎇 完美收官！终极大满贯神图已生成，可以直接放入明天的 PPT 了！")
+except Exception as e:
+    print(f"画图失败，错误信息: {e}")
